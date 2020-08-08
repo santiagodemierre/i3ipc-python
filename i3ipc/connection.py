@@ -5,7 +5,7 @@ from .replies import (BarConfigReply, CommandReply, ConfigReply, OutputReply, Ti
                       VersionReply, WorkspaceReply, SeatReply, InputReply)
 from .events import (IpcBaseEvent, BarconfigUpdateEvent, BindingEvent, OutputEvent, ShutdownEvent,
                      WindowEvent, TickEvent, ModeEvent, WorkspaceEvent, InputEvent, Event)
-from ._private import PubSub, MessageType, EventType, Synchronizer
+from ._private import PubSub, MessageType, EventType
 
 from typing import List, Optional, Union, Callable
 import struct
@@ -16,7 +16,7 @@ from threading import Timer, Lock
 import time
 import Xlib
 import Xlib.display
-
+import subprocess
 
 class Connection:
     """A connection to the i3 ipc used for querying window manager state and
@@ -56,6 +56,12 @@ class Connection:
             socket_path = os.environ.get("SWAYSOCK")
 
         if not socket_path:
+            socket_path = os.system("i3 --get-socketpath")
+        
+        if not socket_path:
+            socket_path = str(subprocess.check_output("i3 --get-socketpath",shell=True).decode().strip())
+        
+        if not socket_path:
             try:
                 disp = Xlib.display.Display()
                 root = disp.screen().root
@@ -63,11 +69,16 @@ class Connection:
                 socket_path = root.get_full_property(i3atom, Xlib.X.AnyPropertyType).value.decode()
             except Exception:
                 pass
-
+        
+            
         if not socket_path:
             raise Exception('Failed to retrieve the i3 or sway IPC socket path')
 
-        self.subscriptions = 0
+        if auto_reconnect:
+            self.subscriptions = EventType.SHUTDOWN.value
+        else:
+            self.subscriptions = 0
+
         self._pubsub = PubSub(self)
         self._socket_path = socket_path
         self._cmd_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -76,14 +87,8 @@ class Connection:
         self._sub_socket = None
         self._sub_lock = Lock()
         self._auto_reconnect = auto_reconnect
+        self._restarting = False
         self._quitting = False
-        self._synchronizer = None
-
-    def _sync(self):
-        if self._synchronizer is None:
-            self._synchronizer = Synchronizer()
-
-        self._synchronizer.sync()
 
     @property
     def socket_path(self) -> str:
@@ -460,6 +465,8 @@ class Connection:
         elif msg_type == EventType.SHUTDOWN.value:
             event_name = 'shutdown'
             event = ShutdownEvent(data)
+            if event.change == 'restart':
+                self._restarting = True
         elif msg_type == EventType.TICK.value:
             event_name = 'tick'
             event = TickEvent(data)
@@ -484,11 +491,11 @@ class Connection:
         """
         loop_exception = None
         self._quitting = False
-        timer = None
-
         while True:
             try:
                 self._event_socket_setup()
+
+                timer = None
 
                 if timeout:
                     timer = Timer(timeout, self.main_quit)
@@ -504,9 +511,13 @@ class Connection:
 
                 self._event_socket_teardown()
 
-                if self._quitting or not self.auto_reconnect:
+                if self._quitting or not self._restarting or not self.auto_reconnect:
                     break
 
+                self._restarting = False
+                # The ipc told us it's restarting and the user wants to survive
+                # restarts. Wait for the socket path to reappear and reconnect
+                # to it.
                 if not self._wait_for_socket():
                     break
 
